@@ -38,6 +38,20 @@ function eval_tm_point_ic(tm, time_iv)
 end
 
 """
+    eval_tm_set_ic(tm, time_iv, n_vars)
+
+Evaluate a TaylorModel1{TaylorN} at a time interval, then evaluate the resulting
+TaylorN polynomial over the full symmetric box [-1,1]^n_vars.  This gives a
+guaranteed interval enclosure of the state variable over ALL initial conditions
+in the hyperrectangle at the given time interval.
+"""
+function eval_tm_set_ic(tm, time_iv, n_vars::Int)
+    tn = tm(time_iv)
+    box = [interval(-1.0, 1.0) for _ in 1:n_vars]
+    return TaylorSeries.evaluate(tn, box)
+end
+
+"""
     certify_event_time(p, x₁₀, x₂₀; kwargs...) → Certificate
 
 Rigorously certify the first event time using Taylor model flowpipes.
@@ -242,12 +256,209 @@ function certify_event_time(p::LVParams, x₁₀::Real, x₂₀::Real;
 end
 
 """
-    certify_optimum(opt, spec; kwargs...) → Certificate
+    certify_safety_box(spec, τ_hint; kwargs...) → Certificate
 
-Convenience: certify the event time at the optimal parameters from an
-OptimizationResult, using the initial conditions from the problem spec.
+Certify universal safety over the full parameter box Θ using a 9D augmented flowpipe.
+
+The augmented system carries the original LV state (x₁,x₂), the parameters (α,β,δ,γ),
+and three event surface values:
+- u[7] = α − βx₂       (zero ⟺ dx₁/dt = 0)
+- u[8] = δx₁ − γ       (zero ⟺ dx₂/dt = 0)
+- u[9] = αδx₁+βγx₂−αγ  (zero ⟺ det(J) = 0)
+
+Safety check: if 0 ∉ [u₇], 0 ∉ [u₈], 0 ∉ [u₉] at a time step, then all three event
+surfaces are certifiably un-crossed for ALL θ ∈ Θ simultaneously.
+
+Returns a Certificate with τ_lower = minimum safe_until across all surfaces.
+"""
+function certify_safety_box(spec::LVProblemSpec, τ_hint::Real;
+                            time_factor::Float64=1.05,
+                            orderQ::Int=3, orderT::Int=15,
+                            abstol::Float64=1e-15,
+                            n_subdivisions::Int=1_000)
+    wall_start = time()
+
+    x₁₀ = Float64(spec.x₁₀)
+    x₂₀ = Float64(spec.x₂₀)
+    α_lo, α_hi = Float64.(spec.α_bounds)
+    β_lo, β_hi = Float64.(spec.β_bounds)
+    δ_lo, δ_hi = Float64.(spec.δ_bounds)
+    γ_lo, γ_hi = Float64.(spec.γ_bounds)
+
+    # 9D augmented ODE: state + parameters + surface values
+    function augmented_lv!(du, u, params, t)
+        x1, x2 = u[1], u[2]
+        α, β, δ, γ = u[3], u[4], u[5], u[6]
+
+        dx1 = x1 * (α - β * x2)
+        dx2 = x2 * (δ * x1 - γ)
+
+        du[1] = dx1
+        du[2] = dx2
+        du[3] = zero(x1)    # dα/dt = 0
+        du[4] = zero(x1)    # dβ/dt = 0
+        du[5] = zero(x1)    # dδ/dt = 0
+        du[6] = zero(x1)    # dγ/dt = 0
+        du[7] = -β * dx2                       # d(α - βx₂)/dt
+        du[8] = δ * dx1                         # d(δx₁ - γ)/dt
+        du[9] = α * δ * dx1 + β * γ * dx2      # d(αδx₁ + βγx₂ - αγ)/dt
+        return du
+    end
+
+    # Compute IC intervals for u[7:9] using IntervalArithmetic for rigorous bounds
+    α_iv = interval(α_lo, α_hi)
+    β_iv = interval(β_lo, β_hi)
+    δ_iv = interval(δ_lo, δ_hi)
+    γ_iv = interval(γ_lo, γ_hi)
+
+    u7_iv = α_iv - β_iv * x₂₀                                      # α - βx₂₀
+    u8_iv = δ_iv * x₁₀ - γ_iv                                      # δx₁₀ - γ
+    u9_iv = α_iv * δ_iv * x₁₀ + β_iv * γ_iv * x₂₀ - α_iv * γ_iv  # αδx₁₀ + βγx₂₀ - αγ
+
+    # Early exit: if any surface value contains 0 at t=0, safety is immediately lost.
+    # No point building the expensive 9D flowpipe.
+    ic_contains_zero = Dict(
+        "E1" => IntervalArithmetic.inf(u7_iv) <= 0 <= IntervalArithmetic.sup(u7_iv),
+        "E2" => IntervalArithmetic.inf(u8_iv) <= 0 <= IntervalArithmetic.sup(u8_iv),
+        "E3" => IntervalArithmetic.inf(u9_iv) <= 0 <= IntervalArithmetic.sup(u9_iv),
+    )
+    if any(values(ic_contains_zero))
+        wall_time = time() - wall_start
+        surface_safety = Dict(name => !ic_contains_zero[name] for name in ["E1", "E2", "E3"])
+        return Certificate(CERT_FAILED, 0.0, 0.0, EVT_NONE,
+                           wall_time, 0.0, surface_safety)
+    end
+
+    X0 = Hyperrectangle(
+        low  = [x₁₀, x₂₀, α_lo, β_lo, δ_lo, γ_lo,
+                IntervalArithmetic.inf(u7_iv), IntervalArithmetic.inf(u8_iv), IntervalArithmetic.inf(u9_iv)],
+        high = [x₁₀, x₂₀, α_hi, β_hi, δ_hi, γ_hi,
+                IntervalArithmetic.sup(u7_iv), IntervalArithmetic.sup(u8_iv), IntervalArithmetic.sup(u9_iv)]
+    )
+
+    sys = BlackBoxContinuousSystem(augmented_lv!, 9)
+    prob = InitialValueProblem(sys, X0)
+    t_max = Float64(τ_hint) * time_factor
+
+    # Compute flowpipe
+    sol = solve(prob, T=t_max,
+                alg=TMJets21a(orderQ=orderQ, orderT=orderT, abstol=abstol))
+    F = flowpipe(sol)
+
+    # Track safety per surface: latest time where 0 ∉ enclosure
+    safe_until = Dict("E1" => 0.0, "E2" => 0.0, "E3" => 0.0)
+    lost_safety = Dict("E1" => false, "E2" => false, "E3" => false)
+    n_vars = 9
+
+    for rs in F
+        vTM = set(rs)
+        dom = TaylorModels.domain(vTM[1])
+        dom_lo = IntervalArithmetic.inf(dom)
+        dom_hi = IntervalArithmetic.sup(dom)
+        t_lo = tstart(rs)
+        t_hi = tend(rs)
+
+        h = (dom_hi - dom_lo) / n_subdivisions
+
+        for k in 0:(n_subdivisions - 1)
+            if all(values(lost_safety))
+                break
+            end
+
+            sub_lo = dom_lo + k * h
+            sub_hi = min(dom_lo + (k + 1) * h, dom_hi)
+            sub_iv = interval(sub_lo, sub_hi)
+
+            t_sub_hi = t_lo + (t_hi - t_lo) * (k + 1) / n_subdivisions
+
+            # E₁: u[7] = α − βx₂, zero when dx₁/dt = 0
+            if !lost_safety["E1"]
+                u7_enc = eval_tm_set_ic(vTM[7], sub_iv, n_vars)
+                if IntervalArithmetic.inf(u7_enc) > 0 || IntervalArithmetic.sup(u7_enc) < 0
+                    safe_until["E1"] = t_sub_hi
+                else
+                    lost_safety["E1"] = true
+                end
+            end
+
+            # E₂: u[8] = δx₁ − γ, zero when dx₂/dt = 0
+            if !lost_safety["E2"]
+                u8_enc = eval_tm_set_ic(vTM[8], sub_iv, n_vars)
+                if IntervalArithmetic.inf(u8_enc) > 0 || IntervalArithmetic.sup(u8_enc) < 0
+                    safe_until["E2"] = t_sub_hi
+                else
+                    lost_safety["E2"] = true
+                end
+            end
+
+            # E₃: u[9] = αδx₁ + βγx₂ − αγ, zero when det(J) = 0
+            if !lost_safety["E3"]
+                u9_enc = eval_tm_set_ic(vTM[9], sub_iv, n_vars)
+                if IntervalArithmetic.inf(u9_enc) > 0 || IntervalArithmetic.sup(u9_enc) < 0
+                    safe_until["E3"] = t_sub_hi
+                else
+                    lost_safety["E3"] = true
+                end
+            end
+        end
+    end
+
+    wall_time = time() - wall_start
+
+    τ_lower = minimum(values(safe_until))
+
+    surface_safety = Dict(
+        "E1" => !lost_safety["E1"],
+        "E2" => !lost_safety["E2"],
+        "E3" => !lost_safety["E3"]
+    )
+
+    status = τ_lower > 0 ? CERT_SAFETY_ONLY : CERT_FAILED
+
+    return Certificate(status, τ_lower, τ_lower, EVT_NONE,
+                       wall_time, 0.0, surface_safety)
+end
+
+"""
+    certify_optimum(opt, spec; kwargs...) → BoxCertificate
+
+Two-phase certification of the minimum event time over a parameter box:
+1. Box safety (9D augmented flowpipe) → universal τ_lower
+2. Point crossing (2D flowpipe at θ*) → existential τ_upper
 """
 function certify_optimum(opt::OptimizationResult, spec::LVProblemSpec; kwargs...)
+    wall_start = time()
+
+    τ_hint = opt.best.time
     p = opt.best.params
-    return certify_event_time(p, spec.x₁₀, spec.x₂₀; kwargs...)
+
+    # Phase 1: Box safety (9D augmented flowpipe)
+    safety_cert = certify_safety_box(spec, τ_hint; kwargs...)
+    τ_lower = safety_cert.tau_lower
+
+    # Phase 2: Point crossing (existing 2D flowpipe at θ*)
+    crossing_cert = certify_event_time(p, spec.x₁₀, spec.x₂₀; kwargs...)
+    τ_upper = crossing_cert.tau_upper
+
+    wall_time = time() - wall_start
+
+    event_type = crossing_cert.event_type
+
+    # Certified digits from the combined bracket
+    bracket_width = τ_upper - τ_lower
+    midpoint = (τ_lower + τ_upper) / 2
+    certified_digits = (midpoint > 0 && bracket_width > 0) ? -log10(bracket_width / midpoint) : 0.0
+
+    status = if τ_lower > 0 && τ_upper > τ_lower && crossing_cert.status == CERT_VERIFIED
+        CERT_VERIFIED
+    elseif τ_lower > 0
+        CERT_SAFETY_ONLY
+    else
+        CERT_FAILED
+    end
+
+    return BoxCertificate(
+        status, τ_lower, τ_upper, event_type, wall_time, certified_digits,
+        safety_cert.surface_safety, safety_cert, crossing_cert
+    )
 end

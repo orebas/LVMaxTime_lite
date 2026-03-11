@@ -115,16 +115,41 @@ using LVMaxTime_lite
         @test cert_surf.status == CERT_FAILED
     end
 
-    # ── 5. certify_optimum (end-to-end) ──────────────────────────────────────
-    @testset "certify_optimum" begin
+    # ── 5. certify_optimum (two-phase BoxCertificate) ─────────────────────────
+    @testset "certify_optimum (BoxCertificate)" begin
         p = LVParams(3.0, 1.0, 1.1, 2.5)
         spec = LVProblemSpec(2.0, 2.0, (2.5, 3.0), (1.0, 1.1), (1.0, 1.1), (2.5, 3.0))
         result = first_event_time(p, 2.0, 2.0)
         opt = OptimizationResult(result, [result], 0.0, "test", nothing)
 
         cert = certify_optimum(opt, spec)
+        @test cert isa BoxCertificate
         @test cert.status == CERT_VERIFIED
+        @test cert.tau_lower > 0
+        @test cert.tau_upper > cert.tau_lower
         @test cert.tau_lower <= result.time <= cert.tau_upper
+
+        # Sub-certificates should be populated
+        @test cert.safety_details isa Certificate
+        @test cert.crossing_details isa Certificate
+        @test cert.crossing_details.status == CERT_VERIFIED
+    end
+
+    # ── 6. certify_safety_box (box safety phase only) ──────────────────────────
+    @testset "certify_safety_box" begin
+        spec = LVProblemSpec(2.0, 2.0, (2.5, 3.0), (1.0, 1.1), (1.0, 1.1), (2.5, 3.0))
+
+        # Get a τ_hint from a point evaluation at box midpoint
+        p_mid = LVParams(2.75, 1.05, 1.05, 2.75)
+        result = first_event_time(p_mid, 2.0, 2.0)
+        τ_hint = result.time
+
+        safety_cert = certify_safety_box(spec, τ_hint)
+        @test safety_cert.tau_lower > 0
+        @test safety_cert.status == CERT_SAFETY_ONLY  # box phase only proves safety
+
+        # Safety bound should be less than or equal to the float hint (within time_factor)
+        @test safety_cert.tau_lower <= τ_hint * 1.1
     end
 
 end

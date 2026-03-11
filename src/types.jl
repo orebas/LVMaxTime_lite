@@ -86,6 +86,20 @@ struct Certificate{T<:Real}
     surface_safety::Dict{String,Bool}  # per-surface safety through [0, τ_upper]
 end
 
+# Two-phase box certificate: universal safety (9D box flowpipe) + existential crossing (2D point).
+# τ* ∈ [τ_lower, τ_upper] for the minimum first event time over the full parameter box.
+struct BoxCertificate{T<:Real}
+    status::CertificationStatus
+    tau_lower::T               # universal safety (from 9D box flowpipe)
+    tau_upper::T               # existential crossing (from point flowpipe at θ*)
+    event_type::EventType      # which surface the optimizer's θ* crosses first
+    wall_time::Float64
+    certified_digits::Float64
+    surface_safety::Dict{String,Bool}
+    safety_details::Certificate{T}   # box-safety sub-result
+    crossing_details::Certificate{T} # point-crossing sub-result
+end
+
 # ── Utility Functions ────────────────────────────────────────────────────────
 
 # Convert a 4-element vector [α, β, δ, γ] → LVParams.

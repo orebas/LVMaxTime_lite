@@ -104,23 +104,28 @@ function main()
                 "δ=$(round(p.δ, digits=6)), γ=$(round(p.γ, digits=6)))")
         println("    Optimization time: $(round(t_opt, digits=2))s")
 
-        # Step 2: Rigorously certify the result with Taylor model flowpipes
-        println("\n  [2/2] Running rigorous certification...")
+        # Step 2: Rigorously certify (two-phase: box safety + point crossing)
+        println("\n  [2/3] Running box safety certification (9D augmented)...")
+        println("  [3/3] Running point crossing certification (2D at θ*)...")
         cert = certify_optimum(opt, spec)
 
         println("    Status: $(cert.status)")
-        if cert.status == CERT_VERIFIED
+        if cert.status == CERT_VERIFIED || cert.status == CERT_SAFETY_ONLY
+            println("    τ_lower (box safety):    $(cert.tau_lower)")
+            println("    τ_upper (point crossing): $(cert.tau_upper)")
             println("    τ* ∈ [$(cert.tau_lower), $(cert.tau_upper)]")
             println("    Bracket width: $(cert.tau_upper - cert.tau_lower)")
             println("    Certified digits: $(round(cert.certified_digits, digits=1))")
             println("    Float in bracket: $(cert.tau_lower <= opt.best.time <= cert.tau_upper)")
         end
-        println("    Certification time: $(round(cert.wall_time, digits=3))s")
+        println("    Box phase time:   $(round(cert.safety_details.wall_time, digits=3))s")
+        println("    Point phase time: $(round(cert.crossing_details.wall_time, digits=3))s")
+        println("    Total cert time:  $(round(cert.wall_time, digits=3))s")
 
-        # Surface safety report
-        println("    Surface safety:")
+        # Surface safety report (from box phase)
+        println("    Box surface safety (all θ ∈ Θ):")
         for name in ["E1", "E2", "E3"]
-            status_str = cert.surface_safety[name] ? "safe" : "crosses"
+            status_str = cert.surface_safety[name] ? "safe" : "uncertain"
             println("      $name: $status_str")
         end
 
